@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+logs/
+submission.csv
+data_raw/
+tests/*.xlsx
