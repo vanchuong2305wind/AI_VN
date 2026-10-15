@@ -2,6 +2,6 @@
 __pycache__/
 *.pyc
 logs/
-submission.csv
+submission*.csv
 data_raw/
 tests/*.xlsx

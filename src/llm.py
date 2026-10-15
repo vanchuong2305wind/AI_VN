@@ -31,19 +31,23 @@ class LLM:
 
     def __post_init__(self):
         if not config.API_KEY:
-            raise RuntimeError("Thiếu OPENROUTER_API_KEY (đặt trong file .env hoặc biến môi trường).")
+            raise RuntimeError("Thiếu OPENROUTER_API_KEY hoặc LLM_API_KEY (đặt trong file .env hoặc biến môi trường).")
         self.client = httpx.AsyncClient(
             base_url=config.BASE_URL, timeout=config.LLM_TIMEOUT,
             headers={"Authorization": f"Bearer {config.API_KEY}", "X-Title": "excel-table-qa"})
 
     def _payload(self, messages, temperature, max_tokens):
         body = {"model": self.model, "messages": messages, "temperature": temperature,
-                "max_tokens": max_tokens or config.MAX_TOKENS, "usage": {"include": True}}
+                "max_tokens": max_tokens or config.MAX_TOKENS}
         r = config.REASONING.lower()
-        if r == "off":
-            body["reasoning"] = {"enabled": False}
-        elif r in ("low", "medium", "high"):
-            body["reasoning"] = {"effort": r, "exclude": True}
+        if config.IS_OPENROUTER:
+            body["usage"] = {"include": True}
+            if r == "off":
+                body["reasoning"] = {"enabled": False}
+            elif r in ("low", "medium", "high"):
+                body["reasoning"] = {"effort": r, "exclude": True}
+        elif r != "default":                         # API chuẩn OpenAI (Gemini, ...)
+            body["reasoning_effort"] = "none" if r == "off" else r
         return body
 
     async def chat(self, messages: list[dict], usage: Usage, temperature: float = 0.0,
@@ -66,8 +70,20 @@ class LLM:
                 if attempt == config.LLM_RETRIES:
                     print(f"[llm] lỗi sau {attempt + 1} lần thử: {e}")
                     return ""
-                await asyncio.sleep(1.5 * 2 ** attempt)
+                await asyncio.sleep(self._wait_time(e, attempt))
         return ""
+
+    @staticmethod
+    def _wait_time(e: Exception, attempt: int) -> float:
+        """Đợi theo yêu cầu của server (Retry-After / 'retry in Xs') nếu có, không thì backoff."""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            if resp.headers.get("retry-after", "").replace(".", "").isdigit():
+                return min(float(resp.headers["retry-after"]), 60)
+            m = re.search(r"retry in ([\d.]+)s", resp.text)
+            if m:
+                return min(float(m.group(1)) + 1, 60)
+        return 1.5 * 2 ** attempt
 
     async def close(self):
         await self.client.aclose()

@@ -16,9 +16,11 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# Mặc định: Qwen qua OpenRouter (bắt buộc khi chấm). LLM_* dùng để thử với nhà cung cấp khác (vd Gemini).
+API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+BASE_URL = os.getenv("LLM_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 MODEL = os.getenv("MODEL", "qwen/qwen3.7-flash")
+IS_OPENROUTER = "openrouter.ai" in BASE_URL
 REASONING = os.getenv("REASONING", "low")          # off | low | medium | high | default
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", 4096))
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", 60))
