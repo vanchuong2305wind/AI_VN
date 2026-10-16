@@ -1,4 +1,3 @@
-"""Bước ④: chạy code của LLM trong tiến trình con, có timeout."""
 from __future__ import annotations
 
 import asyncio
@@ -30,8 +29,18 @@ def dump_tables(tables: list[Table], key: str) -> Path:
     return path
 
 
+_SLOTS: asyncio.Semaphore | None = None
+
+
 async def run_code(code: str, tables_pkl: Path) -> dict:
-    """-> {"ok": True, "result": ...} hoặc {"ok": False, "error": "..."}"""
+    global _SLOTS
+    if _SLOTS is None:
+        _SLOTS = asyncio.Semaphore(config.SANDBOX_CONCURRENCY)
+    async with _SLOTS:
+        return await _run(code, tables_pkl)
+
+
+async def _run(code: str, tables_pkl: Path) -> dict:
     code_path = WORKDIR / f"sol_{uuid.uuid4().hex}.py"
     code_path.write_text(code, encoding="utf-8")
     proc = await asyncio.create_subprocess_exec(

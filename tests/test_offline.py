@@ -1,10 +1,3 @@
-"""Kiểm thử offline (không cần API): code solve() viết tay đóng vai LLM,
-chạy qua parser -> sandbox -> formatter thật, so với đáp án mẫu.
-Mục đích: chứng minh dữ liệu sau parse đủ để trả lời và formatter ra đúng định dạng.
-File này KHÔNG được dùng trong pipeline chính.
-
-Chạy:  python tests/test_offline.py
-"""
 import asyncio
 import csv
 import json
@@ -14,13 +7,12 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from src.formatter import format_answer          # noqa: E402
-from src.parser import parse_workbook            # noqa: E402
-from src.sandbox import dump_tables, run_code    # noqa: E402
+from src.formatter import format_answer
+from src.parser import parse_workbook
+from src.sandbox import dump_tables, run_code
 
 DATA = ROOT / "data_raw"
 
-# Code mẫu như LLM sẽ viết (dùng cột/nhãn đúng như phần render cho LLM thấy)
 SOLUTIONS = {
     "p4_q001": """
 def solve(tables):
@@ -108,7 +100,44 @@ def solve(tables):
 }
 
 
+FORMAT_CASES = [
+    (50.0, "Chỉ trả lời bằng số với đúng một chữ số thập phân.", "50.0"),
+    (14.2, "소수점 둘째 자리까지, % 기호 없이 숫자만 답하십시오.", "14.20"),
+    (82, "保留一位小数，只回答数字，不带%符号。", "82.0"),
+    (14.8, "Répondez uniquement par le nombre avec deux décimales, sans le symbole %.", "14.80"),
+    (3.456, "소수점 둘째 자리에서 반올림하여 답하십시오", "3.5"),
+    (27124.0, "Chỉ trả lời bằng số nguyên, không có dấu phẩy.", "27124"),
+    (2.675, "using exactly two decimal places", "2.68"),
+    (2.5, "Answer with only the integer.", "3"),
+    ("1,000+, 2.8", "Answer as `size class, gap`, separated by a comma and one space, with the gap using exactly one "
+                    "decimal place.", "1,000+, 2.8"),
+    ("7,668", "Answer with only the integer, without commas or units.", "7668"),
+    ("Chinese > 2014", "Answer with only the group name exactly as it appears in the table.", "Chinese"),
+    ("T3, 2232", "Which sheet reports the highest value? Answer as `sheet name, integer value`, separated by a comma.",
+     "table_2, 2232"),
+    ("Manufacturing, Construction, Agriculture and related",
+     "Rank the following sectors: Agriculture, Manufacturing, and Construction. Answer with the three sector names "
+     "in descending order, separated by a comma and one space.", "Manufacturing, Construction, Agriculture"),
+    ("Hispanic or Latino ethnicity", "Answer with only the group name: White, Asian, or Hispanic or Latino.",
+     "Hispanic or Latino"),
+    ("Asian Indian", "Which group? Answer with only the group name exactly as it appears in the table.", "Asian Indian"),
+]
+
+
+def test_formatter() -> int:
+    labels, sheets = {"Chinese", "1,000+", "2014", "Chinese > 2014"}, {"T3": "table_2"}
+    ok = 0
+    for value, query, want in FORMAT_CASES:
+        got = format_answer(value, query, labels, sheets)
+        ok += got == want
+        if got != want:
+            print(f"✗ format {value!r}: {got!r}  (muốn {want!r})")
+    print(f"Formatter: {ok}/{len(FORMAT_CASES)} đúng\n")
+    return ok
+
+
 async def main():
+    test_formatter()
     queries = json.loads((DATA / "queries.json").read_text(encoding="utf-8"))
     with open(DATA / "sample_submission.csv", encoding="utf-8-sig") as f:
         gold = {r["id"]: r["answer"] for r in csv.DictReader(f)}

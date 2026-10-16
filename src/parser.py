@@ -1,4 +1,3 @@
-"""Bước ①: Excel -> danh sách bảng sạch (bảng rộng df + bảng dài long)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -10,28 +9,33 @@ import openpyxl
 import pandas as pd
 from openpyxl.utils import get_column_letter
 
-MISSING = {"", "none", "nan", "�", "-", "–", "—", "(na)", "n/a", "na", "...", "…", "(x)"}
+MISSING = {"", "none", "nan", "�", "-", "–", "—", "(na)", "n/a", "na", "...", "…", "(x)", "..", "(d)", "(s)",
+           "(z)", "n.a.", "n.d."}
+PLACEHOLDER_RE = re.compile(r"^\(-\d+-\)$|^-\d+-$"
+                            r"|^\((?:[a-z]|[ivx]{2,4})\)$")
 KEEP_HYPHEN = {"self", "non", "co", "full", "part", "year", "well", "high", "low", "long", "short", "multi"}
 NOTE_RE = re.compile(r"^(footnotes?|notes?|source|sources)\b|^\(\d+\)|^\d+/\s", re.I)
 FOOTNOTE_RE = re.compile(r"\s*\(\d+\)|\s+\d+/(?=\s|$)")
 NUM_RE = re.compile(r"^[+-]?\(?\$?\d[\d,]*(\.\d+)?\)?%?$")
+CODE_RE = re.compile(r"^(?=.*[A-Z])[A-Z0-9]{3,8}$")
 
 
 @dataclass
 class Table:
     id: str
     sheet: str
-    kind: str                       # "matrix" | "records"
+    kind: str
     df: pd.DataFrame
-    columns: dict[str, str]         # c1 -> tên cột đầy đủ "A > B"
+    columns: dict[str, str]
     context: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     label_header: str = ""
     long: pd.DataFrame | None = None
     labels: set[str] = field(default_factory=set)
+    phys: dict[str, int] = field(default_factory=dict)
+    code_header: bool = False
 
 
-# ---------------------------------------------------------------- làm sạch giá trị
 def clean_text(s: str) -> str:
     def join(m: re.Match) -> str:
         prefix = re.findall(r"[A-Za-z]+$", m.group(1))
@@ -39,7 +43,7 @@ def clean_text(s: str) -> str:
         return f"{m.group(1)}-{m.group(2)}" if keep else m.group(1) + m.group(2)
 
     s = s.replace("\xa0", " ")
-    s = re.sub(r"(\w+)-\s*\n\s*([a-z])", join, s)       # "Con-\nstruction" -> "Construction"
+    s = re.sub(r"(\w+)-\s*\n\s*([a-z])", join, s)
     s = re.sub(r"\s+", " ", s).strip()
     return FOOTNOTE_RE.sub("", s).strip()
 
@@ -54,7 +58,7 @@ def clean_value(v):
     if isinstance(v, dt.date):
         return dt.datetime(v.year, v.month, v.day)
     s = str(v).replace("\xa0", " ").strip()
-    if s.lower() in MISSING:
+    if s.lower() in MISSING or PLACEHOLDER_RE.match(s):
         return None
     if NUM_RE.match(s):
         num = float(re.sub(r"[^\d.]", "", s))
@@ -86,17 +90,25 @@ def is_caps(s: str) -> bool:
     return len(letters) > 2 and letters.isupper()
 
 
-# ---------------------------------------------------------------- lưới ô
 class Grid:
-    """Giá trị các ô của 1 sheet (đánh số từ 1), đã điền giá trị cho ô gộp."""
 
     def __init__(self, ws):
         raw = {}
+        self.indent = {}
+        self.na = {}
         for row in ws.iter_rows():
             for c in row:
-                v = clean_value(getattr(c, "value", None))
+                value = getattr(c, "value", None)
+                v = clean_value(value)
+                if v is None and isinstance(value, str) and value.strip():
+                    self.na[c.row] = self.na.get(c.row, 0) + 1
                 if v is not None:
                     raw[(c.row, c.column)] = v
+                    if isinstance(v, str):
+                        lead = len(value) - len(value.lstrip(" \xa0　"))
+                        align = getattr(getattr(c, "alignment", None), "indent", 0) or 0
+                        if lead or align:
+                            self.indent[(c.row, c.column)] = int(align) * 3 + lead
         self.nrows = max((r for r, _ in raw), default=0)
         self.ncols = max((c for _, c in raw), default=0)
         self.val = [[None] * (self.ncols + 1) for _ in range(self.nrows + 1)]
@@ -115,7 +127,6 @@ class Grid:
                     self.origin[(r, c)] = (r0, c0)
 
     def cells(self, r):
-        """[(col, value)] các ô khác rỗng của dòng r, vùng gộp ngang chỉ tính 1 lần."""
         out, seen = [], set()
         for c in range(1, self.ncols + 1):
             v = self.val[r][c]
@@ -128,16 +139,18 @@ class Grid:
         return out
 
 
-# ---------------------------------------------------------------- tách bảng
 def row_kind(grid: Grid, r: int, c0: int) -> str:
-    """empty | data | years | text | single_label (1 ô ở cột đầu) | single_span (1 ô ở cột khác)."""
     cells = grid.cells(r)
     if not cells:
         return "empty"
+    if (len(cells) == 2 and is_num(cells[0][1]) and float(cells[0][1]).is_integer() and 0 <= cells[0][1] <= 9
+            and isinstance(cells[1][1], str)):
+        return "single_label"
     nums = [v for _, v in cells if is_num(v) or isinstance(v, dt.datetime)]
     if nums and all(is_year(v) for v in nums):
         return "text" if grid.val[r][c0] is None else "years"
-    if nums and len(nums) >= 0.4 * len(cells):
+    na = grid.na.get(r, 0)
+    if (nums or na) and len(nums) + na >= 0.4 * (len(cells) + na):
         return "data"
     if len(cells) == 1:
         return "single_label" if cells[0][0] == c0 else "single_span"
@@ -148,13 +161,11 @@ def row_kind(grid: Grid, r: int, c0: int) -> str:
 class Block:
     titles: list[int] = field(default_factory=list)
     header: list[int] = field(default_factory=list)
-    body: list[tuple[int, str]] = field(default_factory=list)   # (row, "data" | "section")
+    body: list[tuple[int, str]] = field(default_factory=list)
     notes: list[int] = field(default_factory=list)
 
 
 def split_blocks(grid: Grid, c0: int) -> list[Block]:
-    """Chia sheet thành các bảng: tiêu đề -> header -> thân -> ghi chú.
-    Gặp dòng header sau phần thân = bắt đầu bảng mới."""
     kinds = {r: row_kind(grid, r, c0) for r in range(1, grid.nrows + 1)}
     blocks, buf, cur, in_notes = [], [], None, False
 
@@ -171,7 +182,7 @@ def split_blocks(grid: Grid, c0: int) -> list[Block]:
 
     for r in range(1, grid.nrows + 1):
         k = kinds[r]
-        if k == "years":                       # dòng toàn số năm: trước thân bảng là header
+        if k == "years":
             k = kinds[r] = "text" if cur is None else "data"
         if cur is None:
             if k == "data":
@@ -191,7 +202,7 @@ def split_blocks(grid: Grid, c0: int) -> list[Block]:
             else:
                 cur.body.append((r, "section"))
         else:
-            trailing = []                      # mục cuối bảng cũ chưa có dữ liệu -> tiêu đề bảng mới
+            trailing = []
             while cur.body and cur.body[-1][1] == "section":
                 trailing.insert(0, cur.body.pop()[0])
             blocks.append(cur)
@@ -201,22 +212,22 @@ def split_blocks(grid: Grid, c0: int) -> list[Block]:
     return blocks
 
 
-# ---------------------------------------------------------------- dựng bảng
 def detect_label_col(grid: Grid, data_rows: list[int], cols: list[int]):
-    """Cột nhãn = cột chữ đầu tiên (trong 3 cột đầu) mà các cột sau nó chủ yếu là số."""
     def text_ratio(c):
         vals = [grid.val[r][c] for r in data_rows if grid.val[r][c] is not None]
         return sum(isinstance(v, str) for v in vals) / len(vals) if vals else 0.0
 
+    def filled(c):
+        return sum(grid.val[r][c] is not None for r in data_rows)
+
     for c in cols[:3]:
         if text_ratio(c) >= 0.6:
-            rest = [x for x in cols if x > c]
+            rest = [x for x in cols if x > c and filled(x) >= max(2, 0.1 * len(data_rows))] or [x for x in cols if x > c]
             return c if rest and all(text_ratio(x) < 0.3 for x in rest) else None
     return None
 
 
 def section_paths(body, grid: Grid, label_col: int) -> dict[int, str]:
-    """Mục VIẾT HOA -> mục gốc; mục ngay sau mục -> mục con; mục sau dữ liệu -> mục ngang hàng."""
     path, had_data, out = [], True, {}
     for r, kind in body:
         if kind == "data":
@@ -235,7 +246,6 @@ def section_paths(body, grid: Grid, label_col: int) -> dict[int, str]:
 
 
 def repeat_groups(labels: list[str]) -> list[str]:
-    """Nhãn lặp lại trong 1 mục (vd '16 to 19 years') -> dòng ngay trước lần lặp là nhóm cha."""
     if len(set(labels)) == len(labels):
         return [""] * len(labels)
     groups, cur, seen = [""] * len(labels), labels[0], set()
@@ -249,8 +259,39 @@ def repeat_groups(labels: list[str]) -> list[str]:
     return groups
 
 
+def join_header(parts: list[tuple[str, bool]]) -> str:
+    out, prev_merged = "", True
+    for text, merged in parts:
+        wrapped = out and not merged and not prev_merged
+        if wrapped and out.endswith("-") and text[:1].islower():
+            word = re.findall(r"([A-Za-z]+)-$", out)
+            out = out if word and word[0].lower() in KEEP_HYPHEN else out[:-1]
+            out += text
+        elif wrapped and (out[-1] in ",&/" or text[:1].islower() or text[:1] == "&"):
+            out += " " + text
+        else:
+            out = f"{out} > {text}" if out else text
+        prev_merged = merged
+    return out
+
+
+def indent_parents(df: pd.DataFrame, rows: list[int], grid: Grid, label_col: int) -> bool:
+    levels = [grid.indent.get((r, label_col), 0) for r in rows]
+    if len(set(levels)) < 2:
+        return False
+    parents, stack, section = [], [], None
+    for lvl, lab, sec in zip(levels, df["label"], df["section"]):
+        if sec != section:
+            stack, section = [], sec
+        while stack and stack[-1][0] >= lvl:
+            stack.pop()
+        parents.append(stack[-1][1] if stack else "")
+        stack.append((lvl, lab))
+    df["group"] = parents
+    return True
+
+
 def indent_groups(df: pd.DataFrame, columns: dict[str, str]) -> bool:
-    """Bảng có cột 'Indent Level' -> group = đường dẫn các dòng cha."""
     ind = next((c for c, n in columns.items() if re.search(r"indent|level", n, re.I)), None)
     if ind is None or not pd.api.types.is_numeric_dtype(df[ind]):
         return False
@@ -263,16 +304,15 @@ def indent_groups(df: pd.DataFrame, columns: dict[str, str]) -> bool:
     return True
 
 
-def build_table(grid: Grid, block: Block, c0: int, sheet: str, tid: str) -> Table | None:
+def build_table(grid: Grid, block: Block, c0: int, sheet: str, tid: str,
+                named: dict[int, str] | None = None) -> Table | None:
     data_rows = [r for r, k in block.body if k == "data"]
     if not data_rows:
         return None
-    cols = [c for c in range(1, grid.ncols + 1)
-            if any(grid.val[r][c] is not None for r in data_rows + block.header)]
+    cols = [c for c in range(1, grid.ncols + 1) if any(grid.val[r][c] is not None for r in data_rows)]
     label_col = detect_label_col(grid, data_rows, cols)
     value_cols = [c for c in cols if c != label_col]
 
-    # Header nhiều tầng -> tên cột; tầng giống nhau ở mọi cột (vd "2023") -> context
     context = [to_text(v) for r in block.titles for _, v in grid.cells(r)]
     parts = {c: [] for c in value_cols}
     for h in block.header:
@@ -281,18 +321,28 @@ def build_table(grid: Grid, block: Block, c0: int, sheet: str, tid: str) -> Tabl
             context.append(texts[0])
             continue
         for c, t in zip(value_cols, texts):
-            if t and t not in parts[c]:
-                parts[c].append(t)
+            if t and t not in (p for p, _ in parts[c]):
+                parts[c].append((t, (h, c) in grid.origin))
     label_header = ""
     if label_col:
         label_header = " > ".join(dict.fromkeys(
             to_text(grid.val[h][label_col]) for h in block.header if grid.val[h][label_col] is not None))
 
-    columns, seen = {}, {}
+    own = {c: join_header(parts[c]) for c in value_cols}
+    texts = [p for c in value_cols for p, _ in parts[c]]
+    code_header = (len(texts) >= 2 and all(CODE_RE.match(p) for p in texts)
+                   and len({len(p) for p in texts}) == 1)
+    inherit = named and sum(c in named for c in value_cols) >= 0.8 * len(value_cols) and (
+        code_header or (not texts and set(value_cols) == set(named)))
+    columns, seen, phys = {}, {}, {}
     for i, c in enumerate(value_cols, 1):
-        name = " > ".join(parts[c]) or get_column_letter(c)
+        name = own[c]
+        if inherit and c in named:
+            name = f"{named[c]} > {name}" if name else named[c]
+        name = name or get_column_letter(c)
         seen[name] = seen.get(name, 0) + 1
         columns[f"c{i}"] = name if seen[name] == 1 else f"{name} #{seen[name]}"
+        phys[f"c{i}"] = c
 
     sections = section_paths(block.body, grid, label_col) if label_col else {}
     records = []
@@ -312,13 +362,13 @@ def build_table(grid: Grid, block: Block, c0: int, sheet: str, tid: str) -> Tabl
             df[c] = pd.to_datetime(df[c])
 
     kind = "matrix" if label_col else "records"
-    if kind == "matrix" and not indent_groups(df, columns):
+    if kind == "matrix" and not indent_groups(df, columns) and not indent_parents(df, data_rows, grid, label_col):
         for _, idx in df.groupby("section", sort=False).groups.items():
             df.loc[idx, "group"] = repeat_groups(df.loc[idx, "label"].tolist())
 
     t = Table(id=tid, sheet=sheet, kind=kind, df=df, columns=columns, label_header=label_header,
               context=[x for x in dict.fromkeys(context) if x],
-              notes=[to_text(grid.val[r][c0]) for r in block.notes])
+              notes=[to_text(grid.val[r][c0]) for r in block.notes], phys=phys, code_header=code_header)
     t.long = to_long(t)
     t.labels = (set(columns.values()) | set(df["section"]) | set(df["group"])
                 | {p for v in columns.values() for p in v.split(" > ")}
@@ -329,7 +379,6 @@ def build_table(grid: Grid, block: Block, c0: int, sheet: str, tid: str) -> Tabl
 
 
 def to_long(t: Table) -> pd.DataFrame | None:
-    """Mỗi ô số -> 1 dòng (row, section, group, label, col, col_name, value)."""
     if t.kind != "matrix":
         return None
     num_cols = [c for c in t.columns if pd.api.types.is_numeric_dtype(t.df[c])]
@@ -341,7 +390,7 @@ def to_long(t: Table) -> pd.DataFrame | None:
 
 def parse_workbook(path: str | Path) -> list[Table]:
     path = Path(path)
-    big = path.stat().st_size > 20 * 1024 * 1024        # file rất lớn: read_only để tiết kiệm RAM
+    big = path.stat().st_size > 20 * 1024 * 1024
     wb = openpyxl.load_workbook(path, data_only=True, read_only=big)
     tables = []
     for ws in wb.worksheets:
@@ -350,9 +399,12 @@ def parse_workbook(path: str | Path) -> list[Table]:
             continue
         c0 = min(c for c in range(1, grid.ncols + 1)
                  if any(grid.val[r][c] is not None for r in range(1, grid.nrows + 1)))
+        named = {}
         for block in split_blocks(grid, c0):
-            t = build_table(grid, block, c0, ws.title, f"T{len(tables) + 1}")
+            t = build_table(grid, block, c0, ws.title, f"T{len(tables) + 1}", named)
             if t is not None:
                 tables.append(t)
+                if not t.code_header:
+                    named = {t.phys[c]: name for c, name in t.columns.items()}
     wb.close()
     return tables

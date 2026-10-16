@@ -1,4 +1,3 @@
-"""Client gọi Qwen qua OpenRouter: bất đồng bộ, retry, đếm token."""
 from __future__ import annotations
 
 import asyncio
@@ -15,12 +14,17 @@ class Usage:
     calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    max_prompt: int = 0
     cost: float = 0.0
 
     def add(self, u: dict):
         self.calls += 1
-        self.prompt_tokens += u.get("prompt_tokens", 0) or 0
+        prompt = u.get("prompt_tokens", 0) or 0
+        self.prompt_tokens += prompt
+        self.max_prompt = max(self.max_prompt, prompt)
         self.completion_tokens += u.get("completion_tokens", 0) or 0
+        self.reasoning_tokens += (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
         self.cost += u.get("cost", 0) or 0
 
 
@@ -45,21 +49,21 @@ class LLM:
             if r == "off":
                 body["reasoning"] = {"enabled": False}
             elif r in ("low", "medium", "high"):
-                body["reasoning"] = {"effort": r, "exclude": True}
-        elif r != "default":                         # API chuẩn OpenAI (Gemini, ...)
+                body["reasoning"] = ({"max_tokens": config.REASONING_MAX_TOKENS, "exclude": True}
+                                     if config.REASONING_MAX_TOKENS > 0 else {"effort": r, "exclude": True})
+        elif r != "default":
             body["reasoning_effort"] = "none" if r == "off" else r
         return body
 
     async def chat(self, messages: list[dict], usage: Usage, temperature: float = 0.0,
                    max_tokens: int | None = None) -> str:
-        """Trả về nội dung trả lời, '' nếu thất bại."""
         body = self._payload(messages, temperature, max_tokens)
         for attempt in range(config.LLM_RETRIES + 1):
             try:
                 resp = await self.client.post("/chat/completions", json=body)
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=resp.request, response=resp)
-                if resp.status_code >= 400:              # sai key/tham số: không thử lại
+                if resp.status_code >= 400:
                     print(f"[llm] HTTP {resp.status_code}: {resp.text[:300]}")
                     return ""
                 data = resp.json()
@@ -75,7 +79,6 @@ class LLM:
 
     @staticmethod
     def _wait_time(e: Exception, attempt: int) -> float:
-        """Đợi theo yêu cầu của server (Retry-After / 'retry in Xs') nếu có, không thì backoff."""
         resp = getattr(e, "response", None)
         if resp is not None:
             if resp.headers.get("retry-after", "").replace(".", "").isdigit():

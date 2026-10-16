@@ -1,4 +1,3 @@
-"""Điều phối 1 câu hỏi: parse -> render -> code ‖ đọc trực tiếp -> sandbox -> kiểm tra chéo -> chuẩn hoá."""
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import config, prompts
-from .formatter import format_answer, same_answer
+from .formatter import format_answer, near_miss, same_answer
 from .llm import LLM, Usage
 from .parser import Table, parse_workbook
 from .render import describe_frames, render_tables
@@ -24,6 +23,7 @@ class Workbook:
     rendered: str
     frames: str
     labels: set[str]
+    sheets: dict[str, str]
 
 
 def extract_code(text: str) -> str:
@@ -51,6 +51,54 @@ def is_valid(result) -> bool:
     return True
 
 
+@dataclass
+class Cand:
+    answer: str
+    kind: str
+    code: str = ""
+    reasoning: str = ""
+
+
+@dataclass
+class Cluster:
+    members: list[Cand]
+
+    @property
+    def n_code(self) -> int:
+        return sum(c.kind == "code" for c in self.members)
+
+    @property
+    def n_direct(self) -> int:
+        return sum(c.kind == "direct" for c in self.members)
+
+    @property
+    def weight(self) -> int:
+        return len(self.members)
+
+    @property
+    def answer(self) -> str:
+        return next((c.answer for c in self.members if c.kind == "code"), self.members[0].answer)
+
+    @property
+    def code(self) -> str:
+        return next((c.code for c in self.members if c.code), "")
+
+    @property
+    def reasoning(self) -> str:
+        return next((c.reasoning for c in self.members if c.reasoning), "")
+
+
+def vote(cands: list[Cand]) -> list[Cluster]:
+    clusters: list[Cluster] = []
+    for c in cands:
+        cl = next((cl for cl in clusters if same_answer(c.answer, cl.answer) or near_miss(cl.answer, c.answer)), None)
+        if cl:
+            cl.members.append(c)
+        else:
+            clusters.append(Cluster([c]))
+    return sorted(clusters, key=lambda cl: (-cl.weight, -cl.n_code))
+
+
 def find_file(xlsx_dir: Path, file_name: str) -> Path:
     p = xlsx_dir / file_name
     if p.exists():
@@ -71,7 +119,6 @@ class Solver:
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def load(self, file_name: str) -> Workbook:
-        """Parse + render mỗi file đúng 1 lần."""
         lock = self._locks.setdefault(file_name, asyncio.Lock())
         async with lock:
             if file_name not in self._cache:
@@ -85,16 +132,15 @@ class Solver:
         labels = set().union(*(t.labels for t in tables)) if tables else set()
         return Workbook(tables=tables, pkl=dump_tables(tables, key),
                         rendered=render_tables(tables, config.TABLE_TOKEN_BUDGET),
-                        frames=describe_frames(tables), labels=labels)
+                        frames=describe_frames(tables), labels=labels, sheets={t.id: t.sheet for t in tables})
 
-    async def code_path(self, wb: Workbook, question: str, usage: Usage):
-        """LLM viết code -> chạy sandbox -> lỗi thì gửi lỗi cho LLM sửa."""
+    async def code_path(self, wb: Workbook, question: str, usage: Usage, temperature: float = 0.0):
         messages = [{"role": "system", "content": prompts.CODE_SYSTEM},
                     {"role": "user", "content": prompts.CODE_USER.format(
                         tables=wb.rendered, frames=wb.frames, question=question)}]
         code, error = "", ""
         for _ in range(config.MAX_REPAIRS + 1):
-            reply = await self.llm.chat(messages, usage, temperature=0.0)
+            reply = await self.llm.chat(messages, usage, temperature=temperature)
             code = extract_code(reply)
             if not code:
                 error = "No python code block with `def solve(tables):` found."
@@ -109,19 +155,27 @@ class Solver:
                          {"role": "user", "content": prompts.REPAIR_USER.format(error=error)}]
         return code, None
 
-    async def direct_path(self, wb: Workbook, question: str, usage: Usage):
+    async def direct_path(self, wb: Workbook, question: str, usage: Usage, temperature: float = 0.0):
         reply = await self.llm.chat(
             [{"role": "system", "content": prompts.DIRECT_SYSTEM},
              {"role": "user", "content": prompts.DIRECT_USER.format(tables=wb.rendered, question=question)}],
-            usage, temperature=0.0)
+            usage, temperature=temperature)
         return reply, extract_answer(reply)
 
-    async def judge(self, wb, question, code, ans_a, reasoning_b, ans_b, usage) -> str:
+    async def judge(self, wb, question, clusters: list[Cluster], usage) -> str:
+        blocks = []
+        for i, cl in enumerate(clusters[:4], 1):
+            lines = [f"Candidate {i}: {cl.answer}",
+                     f"  supported by {cl.n_code} pandas-code solver(s) and {cl.n_direct} table-reading solver(s)"]
+            if cl.code:
+                lines.append(f"  code of one supporter:\n```python\n{cl.code[:2500]}\n```")
+            if cl.reasoning:
+                lines.append(f"  reasoning of one supporter (end):\n{cl.reasoning[-1500:]}")
+            blocks.append("\n".join(lines))
         reply = await self.llm.chat(
             [{"role": "system", "content": prompts.JUDGE_SYSTEM},
              {"role": "user", "content": prompts.JUDGE_USER.format(
-                 tables=wb.rendered, question=question, code=code, result_a=ans_a,
-                 reasoning_b=reasoning_b[-2500:], result_b=ans_b)}],
+                 tables=wb.rendered, question=question, candidates="\n\n".join(blocks))}],
             usage, temperature=0.0)
         return extract_answer(reply)
 
@@ -130,37 +184,51 @@ class Solver:
         log = {"id": qid, "file": file_name, "query": question}
         try:
             wb = await self.load(file_name)
-            fmt = lambda v: format_answer(v, question, wb.labels)          # noqa: E731
+            fmt = lambda v: format_answer(v, question, wb.labels, wb.sheets)
+            late = time.time() - self.start > config.SOFT_DEADLINE
+            n_code, n_direct = (1, 1) if late else (config.CODE_SAMPLES, config.DIRECT_SAMPLES)
+            temps = lambda n: [0.0][:n] + [config.SAMPLE_TEMPERATURE] * (n - 1)
 
             if config.MODE == "code":
-                code, raw_a = await self.code_path(wb, question, usage)
-                reasoning_b, raw_b = ("", "") if raw_a is not None else await self.direct_path(wb, question, usage)
+                codes = [await self.code_path(wb, question, usage)]
+                directs = [] if codes[0][1] is not None else [await self.direct_path(wb, question, usage)]
             else:
-                (code, raw_a), (reasoning_b, raw_b) = await asyncio.gather(
-                    self.code_path(wb, question, usage), self.direct_path(wb, question, usage))
-            ans_a = fmt(raw_a) if raw_a is not None else ""
-            ans_b = fmt(raw_b) if raw_b else ""
-            log.update(code=code, raw_a=raw_a, ans_a=ans_a, ans_b=ans_b)
+                codes, directs = await asyncio.gather(
+                    asyncio.gather(*(self.code_path(wb, question, usage, t) for t in temps(n_code))),
+                    asyncio.gather(*(self.direct_path(wb, question, usage, t) for t in temps(n_direct))))
+            cands = [Cand(fmt(raw), "code", code=code) for code, raw in codes if raw is not None]
+            cands += [Cand(fmt(ans), "direct", reasoning=reply) for reply, ans in directs if ans]
+            clusters = vote([c for c in cands if c.answer])
+            log.update(code=codes[0][0], raw_a=codes[0][1],
+                       ans_a=fmt(codes[0][1]) if codes[0][1] is not None else "",
+                       ans_b=fmt(directs[0][1]) if directs and directs[0][1] else "",
+                       candidates=[[cl.answer, cl.n_code, cl.n_direct] for cl in clusters])
 
-            if ans_a and ans_b and same_answer(ans_a, ans_b):
-                answer, source = ans_a, "agree"
-            elif ans_a and not ans_b:
-                answer, source = ans_a, "code_only"
-            elif ans_b and not ans_a:
-                answer, source = ans_b, "direct_only"
-            elif not ans_a and not ans_b:
+            if not clusters:
                 answer, source = "0", "fallback"
-            elif time.time() - self.start > config.SOFT_DEADLINE:
-                answer, source = ans_a, "code_deadline"
+            elif len(clusters) == 1:
+                cl = clusters[0]
+                answer = cl.answer
+                source = "agree" if cl.n_code and cl.n_direct else ("code_only" if cl.n_code else "direct_only")
+            elif clusters[0].n_code and clusters[0].n_direct and clusters[0].weight > clusters[1].weight:
+                answer, source = clusters[0].answer, "vote"
+            elif clusters[0].n_code >= 2 and clusters[0].n_code == sum(c.kind == "code" for c in cands):
+                answer, source = clusters[0].answer, "code_unanimous"
+            elif late:
+                answer, source = clusters[0].answer, "deadline"
             else:
-                raw_j = await self.judge(wb, question, code, ans_a, reasoning_b, ans_b, usage)
+                raw_j = await self.judge(wb, question, clusters, usage)
                 ans_j = fmt(raw_j) if raw_j else ""
-                answer, source = (ans_j, "judge") if ans_j else (ans_a, "code_after_judge_fail")
+                match = next((cl for cl in clusters if same_answer(ans_j, cl.answer) or near_miss(cl.answer, ans_j)),
+                             None) if ans_j else None
+                answer = match.answer if match else (ans_j or clusters[0].answer)
+                source = "judge" if ans_j else "judge_fail"
                 log["ans_judge"] = ans_j
         except Exception as e:
             answer, source = "0", "error"
             log["error"] = f"{type(e).__name__}: {e}"
         log.update(answer=answer, source=source, seconds=round(time.time() - t0, 2),
                    calls=usage.calls, prompt_tokens=usage.prompt_tokens,
-                   completion_tokens=usage.completion_tokens, cost=round(usage.cost, 6))
+                   completion_tokens=usage.completion_tokens, reasoning_tokens=usage.reasoning_tokens,
+                   max_prompt=usage.max_prompt, cost=round(usage.cost, 6))
         return log

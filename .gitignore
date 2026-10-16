@@ -5,3 +5,5 @@ logs/
 submission*.csv
 data_raw/
 tests/*.xlsx
+data_p2/
+data_x5/

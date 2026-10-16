@@ -1,17 +1,16 @@
-"""Chạy trong tiến trình con: python sandbox_runner.py <tables.pkl> <code.py>"""
 import sys
 
-sys.path.pop(0)          # tránh import nhầm module trong src/
+sys.path.pop(0)
 
-import datetime as dt    # noqa: E402
-import json              # noqa: E402
-import math              # noqa: E402
-import pickle            # noqa: E402
-import re                # noqa: E402
-import traceback         # noqa: E402
+import datetime as dt
+import json
+import math
+import pickle
+import re
+import traceback
 
-import numpy as np       # noqa: E402
-import pandas as pd      # noqa: E402
+import numpy as np
+import pandas as pd
 
 
 def to_jsonable(v):
@@ -41,9 +40,9 @@ def main():
     try:
         exec(compile(code, "solution.py", "exec"), env)
         result = env["solve"](tables)
-        print(json.dumps({"ok": True, "result": to_jsonable(result)}, ensure_ascii=False))
+        print(json.dumps({"ok": True, "result": to_jsonable(result)}, ensure_ascii=True))
     except Exception:
-        print(json.dumps({"ok": False, "error": traceback.format_exc(limit=3)[-1500:]}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": traceback.format_exc(limit=3)[-1500:]}, ensure_ascii=True))
 
 
 if __name__ == "__main__":

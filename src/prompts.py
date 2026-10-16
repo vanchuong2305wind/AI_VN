@@ -1,14 +1,12 @@
-"""Bước ③: các prompt gửi cho LLM.
-
-Quy ước (CONVENTIONS) là các quy tắc tổng quát rút ra từ tập dev, không viết riêng cho câu hỏi nào.
-"""
-
 CONVENTIONS = """\
 Conventions for interpreting questions:
 1. Row labels repeat across sections/groups (e.g. "16 to 19 years" under Total, Men, Women). Always filter by the right
    section/group. If the question names no group (sex, race, ...), use the overall/Total one.
 2. Age questions ("youngest", "oldest", "age") are measured at the date the question refers to
    (e.g. "on their admission date" -> admission date minus birth date). Youngest = smallest age.
+   If the table has a birth date AND an event date (admission, hire, joining, ...), age always means age at that
+   event date (event date minus birth date), even when the question does not mention the date
+   (e.g. "the second-oldest person" -> the person with the second-largest value of (event date - birth date)).
 3. Sums/totals: if the table already has a Total row/column for what is asked, use it; never double count
    subtotal rows together with their child rows.
 4. "Average across all <categories>" = simple mean of every value shown for those categories in that row/column
@@ -18,6 +16,10 @@ Conventions for interpreting questions:
    (e.g. "rank Agriculture, Manufacturing, and Construction"), use the names exactly as written in the question.
 7. "Highest/lowest category" questions consider every row/column shown for that dimension, including aggregate ones,
    unless the question says otherwise.
+8. `section` = the heading row a data row falls under (e.g. an industry name, "Expenditure category");
+   `group` = the row's direct parent in the table's indentation/hierarchy. "Items directly under X" = rows whose
+   group is X. Empty cells mean the value is not available (e.g. "(-8-)", "..") - skip them.
+9. When asked which sheet, answer with the sheet name shown in the table header (e.g. 'table_1'), not the table id.
 """
 
 CODE_SYSTEM = f"""You are an expert data analyst. You answer questions about spreadsheet tables by writing Python (pandas) code.
@@ -57,9 +59,12 @@ DIRECT_USER = """Tables:
 
 Question: {question}"""
 
-JUDGE_SYSTEM = f"""You are a meticulous reviewer. Two solvers answered the same question about spreadsheet tables
-and disagree. Decide which answer is correct (or give the correct one) by checking the cells and the question's
-wording yourself.
+JUDGE_SYSTEM = f"""You are a meticulous reviewer. Several solvers answered the same question about spreadsheet tables
+and disagree. Each candidate answer below shows how many solvers support it, with the code or reasoning of one
+supporter. The majority is not always right: decide which answer is correct (or give the correct one) by checking
+the exact cells, the filters used (section / group / label / column) and the question's wording yourself.
+Pandas-code solvers compute exactly but may pick the wrong rows or columns; table-reading solvers may make
+arithmetic slips.
 
 {CONVENTIONS}
 Be brief. Finish with a single final line exactly in the form:
@@ -70,10 +75,4 @@ JUDGE_USER = """Tables:
 
 Question: {question}
 
-Solver A (pandas code):
-{code}
-Result A: {result_a}
-
-Solver B (reading the table):
-{reasoning_b}
-Result B: {result_b}"""
+{candidates}"""

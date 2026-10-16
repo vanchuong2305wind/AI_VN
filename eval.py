@@ -1,4 +1,3 @@
-"""Chấm Exact Match: python eval.py --pred submission.csv --gold data_raw/sample_submission.csv"""
 import argparse
 import csv
 import json

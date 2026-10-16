@@ -1,6 +1,3 @@
-"""Tạo file Excel khó (nhiều sheet, nhiều bảng, bảng 5.000 dòng) để thử parser.
-Chạy:  python tests/make_synthetic.py tests/synth.xlsx  rồi  python tools/inspect_tables.py tests/synth.xlsx --compact
-"""
 import sys, random, datetime as dt, openpyxl
 out = sys.argv[1]
 wb = openpyxl.Workbook()
