@@ -16,7 +16,7 @@ def fmt(v) -> str:
         return str(int(v))
     return str(v).replace("|", "/").replace("\n", " ")
 
-
+#Ma hoa token
 def est_tokens(text: str) -> int:
     digits = sum(ch.isdigit() for ch in text)
     non_ascii = sum(ord(ch) > 127 for ch in text)
